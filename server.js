@@ -1,4 +1,3 @@
-
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
@@ -12,109 +11,80 @@ const io = new Server(server);
 app.use(express.static('public'));
 
 const rooms = new Map();
-const MAX_LENGTH = 500;
 const cache = new Map();
+const MAX_LENGTH = 500;
 
 async function translate(text, from, to) {
-  const key = `${from}:${to}:${text}`;
+  const key = process.env.AZURE_TRANSLATOR_KEY;
 
-  if (cache.has(key)) {
-    return {
-      text: cache.get(key),
-      translated: true
-    };
+  if (!key) {
+    console.error('AZURE_TRANSLATOR_KEY is missing');
+    return { text, translated: false };
+  }
+
+  const source = from === 'ckb' ? 'ku' : from;
+  const target = to === 'ckb' ? 'ku' : to;
+  const cacheKey = `${source}:${target}:${text}`;
+
+  if (cache.has(cacheKey)) {
+    return { text: cache.get(cacheKey), translated: true };
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    12000
-  );
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
     const params = new URLSearchParams({
-      client: 'dict-chrome-ex',
-      sl: from,
-      tl: to,
-      q: text
+      'api-version': '3.0',
+      from: source,
+      to: target
     });
 
-    const url =
-      `https://translate.googleapis.com/translate_a/t?${params}`;
-
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        Accept: 'application/json'
+    const response = await fetch(
+      `https://api.cognitive.microsofttranslator.com/translate?${params}`,
+      {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Ocp-Apim-Subscription-Key': key,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify([{ Text: text }])
       }
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
+    );
 
     const data = await response.json();
 
-    let translated = '';
-
-    if (Array.isArray(data)) {
-      translated = data.map(item => {
-        if (Array.isArray(item)) {
-          return typeof item[0] === 'string'
-            ? item[0]
-            : '';
-        }
-
-        return typeof item === 'string'
-          ? item
-          : '';
-      }).join('');
+    if (!response.ok) {
+      throw new Error(
+        `Azure HTTP ${response.status}: ${JSON.stringify(data)}`
+      );
     }
 
-    if (
-      !translated.trim() ||
-      translated.trim() === text.trim()
-    ) {
-      return {
-        text,
-        translated: false
-      };
+    const translatedText =
+      data?.[0]?.translations?.[0]?.text?.trim();
+
+    if (!translatedText || translatedText === text.trim()) {
+      return { text, translated: false };
     }
 
     if (cache.size >= 300) {
       cache.delete(cache.keys().next().value);
     }
 
-    cache.set(key, translated.trim());
+    cache.set(cacheKey, translatedText);
 
-    return {
-      text: translated.trim(),
-      translated: true
-    };
-
+    return { text: translatedText, translated: true };
   } catch (error) {
-    console.error(
-      'Translation error:',
-      error.message
-    );
-
-    return {
-      text,
-      translated: false
-    };
-
+    console.error('Azure translation error:', error.message);
+    return { text, translated: false };
   } finally {
     clearTimeout(timeout);
   }
 }
 
 io.on('connection', socket => {
-
-  socket.on('join', (
-    { room, secret, role } = {},
-    ack
-  ) => {
-
+  socket.on('join', ({ room, secret, role } = {}, ack) => {
     if (
       typeof room !== 'string' ||
       !/^\d{6}$/.test(room) ||
@@ -143,10 +113,7 @@ io.on('connection', socket => {
       });
     }
 
-    if (
-      socket.data.room &&
-      socket.data.room !== room
-    ) {
+    if (socket.data.room && socket.data.room !== room) {
       const previousRoom = socket.data.room;
       const previous = rooms.get(previousRoom);
 
@@ -165,11 +132,7 @@ io.on('connection', socket => {
     }
 
     if (!state) {
-      state = {
-        digest,
-        members: new Set()
-      };
-
+      state = { digest, members: new Set() };
       rooms.set(room, state);
     }
 
@@ -185,7 +148,6 @@ io.on('connection', socket => {
 
     socket.data.room = room;
     socket.data.role = role;
-
     state.members.add(socket.id);
     socket.join(room);
 
@@ -197,7 +159,6 @@ io.on('connection', socket => {
   });
 
   socket.on('message', async (text, ack) => {
-
     const room = socket.data.room;
     const role = socket.data.role;
 
@@ -214,15 +175,9 @@ io.on('connection', socket => {
     }
 
     const original = text.trim();
-    const target = role === 'ar'
-      ? 'ckb'
-      : 'ar';
+    const target = role === 'ar' ? 'ckb' : 'ar';
 
-    const result = await translate(
-      original,
-      role,
-      target
-    );
+    const result = await translate(original, role, target);
 
     io.to(room).emit('message', {
       id: crypto.randomUUID(),
@@ -237,13 +192,10 @@ io.on('connection', socket => {
   });
 
   socket.on('disconnect', () => {
-
     const room = socket.data.room;
-
     if (!room) return;
 
     const state = rooms.get(room);
-
     if (!state) return;
 
     state.members.delete(socket.id);
@@ -261,7 +213,5 @@ io.on('connection', socket => {
 server.listen(
   process.env.PORT || 3000,
   '0.0.0.0',
-  () => {
-    console.log('ALSAAD Chat running');
-  }
+  () => console.log('ALSAAD Chat running')
 );
