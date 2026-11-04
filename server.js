@@ -13,22 +13,36 @@ app.use(express.static('public'));
 
 const rooms = new Map();
 const MAX_LENGTH = 500;
+const cache = new Map();
 
 async function translate(text, from, to) {
+  const key = `${from}:${to}:${text}`;
+
+  if (cache.has(key)) {
+    return {
+      text: cache.get(key),
+      translated: true
+    };
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    12000
+  );
 
   try {
     const params = new URLSearchParams({
-      q: text,
-      langpair: `${from}|${to}`
+      client: 'dict-chrome-ex',
+      sl: from,
+      tl: to,
+      q: text
     });
 
     const url =
-      `https://api.mymemory.translated.net/get?${params}`;
+      `https://translate.googleapis.com/translate_a/t?${params}`;
 
     const response = await fetch(url, {
-      method: 'GET',
       signal: controller.signal,
       headers: {
         Accept: 'application/json'
@@ -41,13 +55,25 @@ async function translate(text, from, to) {
 
     const data = await response.json();
 
-    const translated = data?.responseData?.translatedText;
-    const status = Number(data?.responseStatus);
+    let translated = '';
+
+    if (Array.isArray(data)) {
+      translated = data.map(item => {
+        if (Array.isArray(item)) {
+          return typeof item[0] === 'string'
+            ? item[0]
+            : '';
+        }
+
+        return typeof item === 'string'
+          ? item
+          : '';
+      }).join('');
+    }
 
     if (
-      status !== 200 ||
-      typeof translated !== 'string' ||
-      !translated.trim()
+      !translated.trim() ||
+      translated.trim() === text.trim()
     ) {
       return {
         text,
@@ -55,13 +81,22 @@ async function translate(text, from, to) {
       };
     }
 
+    if (cache.size >= 300) {
+      cache.delete(cache.keys().next().value);
+    }
+
+    cache.set(key, translated.trim());
+
     return {
       text: translated.trim(),
       translated: true
     };
 
   } catch (error) {
-    console.error('Translation error:', error.message);
+    console.error(
+      'Translation error:',
+      error.message
+    );
 
     return {
       text,
@@ -75,7 +110,10 @@ async function translate(text, from, to) {
 
 io.on('connection', socket => {
 
-  socket.on('join', ({ room, secret, role } = {}, ack) => {
+  socket.on('join', (
+    { room, secret, role } = {},
+    ack
+  ) => {
 
     if (
       typeof room !== 'string' ||
@@ -105,6 +143,27 @@ io.on('connection', socket => {
       });
     }
 
+    if (
+      socket.data.room &&
+      socket.data.room !== room
+    ) {
+      const previousRoom = socket.data.room;
+      const previous = rooms.get(previousRoom);
+
+      socket.leave(previousRoom);
+      previous?.members.delete(socket.id);
+
+      if (previous) {
+        io.to(previousRoom).emit('presence', {
+          count: previous.members.size
+        });
+
+        if (!previous.members.size) {
+          rooms.delete(previousRoom);
+        }
+      }
+    }
+
     if (!state) {
       state = {
         digest,
@@ -122,24 +181,6 @@ io.on('connection', socket => {
         ok: false,
         error: 'الغرفة ممتلئة'
       });
-    }
-
-    if (socket.data.room && socket.data.room !== room) {
-      const previousRoom = socket.data.room;
-      const previousState = rooms.get(previousRoom);
-
-      socket.leave(previousRoom);
-      previousState?.members.delete(socket.id);
-
-      if (previousState) {
-        io.to(previousRoom).emit('presence', {
-          count: previousState.members.size
-        });
-
-        if (previousState.members.size === 0) {
-          rooms.delete(previousRoom);
-        }
-      }
     }
 
     socket.data.room = room;
@@ -173,8 +214,9 @@ io.on('connection', socket => {
     }
 
     const original = text.trim();
-
-    const target = role === 'ar' ? 'ckb' : 'ar';
+    const target = role === 'ar'
+      ? 'ckb'
+      : 'ar';
 
     const result = await translate(
       original,
@@ -210,14 +252,16 @@ io.on('connection', socket => {
       count: state.members.size
     });
 
-    if (state.members.size === 0) {
+    if (!state.members.size) {
       rooms.delete(room);
     }
   });
 });
 
-const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`ALSAAD Chat running on port ${PORT}`);
-});
+server.listen(
+  process.env.PORT || 3000,
+  '0.0.0.0',
+  () => {
+    console.log('ALSAAD Chat running');
+  }
+);
